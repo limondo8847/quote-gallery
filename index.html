@@ -54,6 +54,12 @@ button{font:inherit;color:inherit;cursor:pointer}
 .thumb:hover{border-color:var(--accent);transform:translateY(-2px)}
 .thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 
+/* 本文検索（OCR） */
+.search{margin:0 0 12px}
+.search input{display:block;width:100%;font:inherit;padding:10px 14px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);transition:border-color .2s}
+.search input:hover,.search input:focus{border-color:var(--accent)}
+.search small{display:block;margin-top:4px;color:var(--muted);font-size:12px}
+
 /* 操作バー */
 .bar{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:0 0 16px}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--card)}
@@ -98,7 +104,7 @@ dialog[open]::backdrop{animation:fade .2s}
 dialog img{display:block;max-width:100%;max-height:80vh;margin:0 auto;border-radius:6px;background:#fff}
 .lb{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-top:10px}
 .lb button,.lb a{background:var(--card);color:var(--ink);border:0;border-radius:8px;padding:6px 14px;text-decoration:none}
-#dCap{flex:1 1 160px;text-align:left}
+#dCap{flex:1 1 160px;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere}
 @keyframes fade{from{opacity:0}}
 @keyframes pop{from{opacity:0;transform:scale(.97)}}
 
@@ -138,6 +144,12 @@ dialog img{display:block;max-width:100%;max-height:80vh;margin:0 auto;border-rad
         <button class="thumb" id="heroBtn" aria-label="今日の名言を拡大して表示"></button>
       </section>
 
+      <!-- 本文検索：SEARCH_API が設定されているときだけ表示 -->
+      <div class="search" id="searchBox" hidden>
+        <input id="q" type="search" placeholder="名言の本文を検索" aria-label="名言の本文を検索" enterkeyhint="search" autocomplete="off" spellcheck="false">
+        <small>画像から読み取った本文が対象です（誤読・全角半角・カタカナ/ひらがなの違いは吸収します）</small>
+      </div>
+
       <div class="bar">
         <div class="seg" role="group" aria-label="並び替えの基準">
           <button id="kDate" aria-pressed="true">日付順</button>
@@ -145,7 +157,7 @@ dialog img{display:block;max-width:100%;max-height:80vh;margin:0 auto;border-rad
         </div>
         <button id="dir" aria-label="並び順を切り替え"><span class="arr">↓</span> <span id="dirTxt"></span></button>
         <button id="rnd">ランダムに表示</button>
-        <span id="count"></span>
+        <span id="count" aria-live="polite"></span>
       </div>
       <div id="msg">読み込み中…</div>
       <div id="grid"></div>
@@ -171,6 +183,9 @@ dialog img{display:block;max-width:100%;max-height:80vh;margin:0 auto;border-rad
 <script>
 // ▼ GASのウェブアプリURL
 const API_URL = 'https://script.google.com/macros/s/AKfycbxQ0hcpEPlBHUsrwhdL2vy8TbuQ6kXn7jSVLmcnHjV-KPRbgySq_tEO5id70L6Z-t3QSg/exec';
+// ▼ OCR検索サーバーのURL（末尾の / は付けない。例：'https://ocr.example.com'）
+//   空文字のままだと検索欄は表示されません。このページがhttpsなら、サーバーもhttpsにしてください。
+const SEARCH_API = 'https://miqapi.limondo.net';
 const CACHE_KEY = 'miq-archive-v1';
 const PAGE = 30; // 一度に表示する枚数（スクロールすると続きを追加）
 
@@ -178,6 +193,8 @@ const $ = s => document.querySelector(s);
 const st = { items: [], people: [], tab: 'all', key: 'date', dir: 'desc' };
 const box = { list: [], i: 0, random: false };
 const view = { list: [], n: 0 };
+// 本文検索の状態。hits は null（検索していない）か、ドライブのファイルID → { score, text } の Map
+const sq = { hits: null, err: false, seq: 0, timer: 0 };
 const disp = n => /^others?$/i.test(n) ? 'その他' : n; // 表示名（Others → その他）
 const isOther = n => disp(n) === 'その他';
 const BASE = new URL('.', location.href).pathname; // サイトの基準パス（例：/quote-gallery/）
@@ -273,9 +290,10 @@ function updateTabs() {
 window.addEventListener('resize', updateTabs);
 
 function visible() {
-  const list = st.tab === 'all' ? [...st.items] : st.items.filter(i => i.person === st.tab);
+  let list = st.tab === 'all' ? [...st.items] : st.items.filter(i => i.person === st.tab);
+  if (sq.hits) list = list.filter(i => sq.hits.has(i.id)); // 本文検索でヒットしたものだけ
   const s = st.dir === 'asc' ? 1 : -1;
-  return list.sort((a, b) => {
+  const cmp = (a, b) => {
     if (st.key === 'date') {
       // 日付不明は常に先頭
       if (!a.posted && !b.posted) return b.uploaded - a.uploaded;
@@ -284,7 +302,9 @@ function visible() {
       return (a.posted - b.posted) * s;
     }
     return (a.uploaded - b.uploaded) * s;
-  });
+  };
+  // 検索中は一致度が高い順（同点は今の並び順）
+  return list.sort(sq.hits ? (a, b) => (sq.hits.get(b.id).score - sq.hits.get(a.id).score) || cmp(a, b) : cmp);
 }
 
 function card(it, list, idx) {
@@ -330,11 +350,42 @@ function render() {
   $('#dirTxt').textContent = st.key === 'date' ? (desc ? '新しい順' : '古い順') : (desc ? '追加が新しい順' : '追加が古い順');
   view.list = visible();
   view.n = 0;
-  $('#count').textContent = `${view.list.length}枚`;
+  $('#count').textContent = sq.err ? '検索に失敗しました（検索サーバーに繋がりません）' : `${view.list.length}枚` + (sq.hits ? 'ヒット' : '');
+  // 検索結果が0件のときだけ、メッセージを出す
+  const m = $('#msg');
+  if (sq.hits && !view.list.length) { m.className = ''; m.textContent = '該当する名言が見つかりませんでした'; m.dataset.none = '1'; m.hidden = false; }
+  else if (m.dataset.none) { delete m.dataset.none; m.hidden = true; }
   const g = $('#grid');
   g.replaceChildren();
   g.classList.remove('fade'); void g.offsetWidth; g.classList.add('fade');
   fill();
+}
+
+// ---- 本文検索（OCR検索サーバーに問い合わせる）
+async function doSearch(q) {
+  const my = ++sq.seq;
+  if (!q) { sq.hits = null; sq.err = false; if (started) render(); return; }
+  let hits = null, err = false;
+  try {
+    const r = await fetch(`${SEARCH_API}/api/search?${new URLSearchParams({ q, limit: 1000 })}`);
+    if (my !== sq.seq) return; // もっと新しい検索が始まっていたら捨てる
+    if (r.status === 400) hits = new Map(); // 記号だけの検索ワードなど → 0件扱い
+    else if (!r.ok) throw new Error(r.status);
+    else {
+      const d = await r.json();
+      hits = new Map();
+      // 同じ画像に複数のファイルIDが紐づいていることがあるので、全部をヒット扱いにする
+      for (const h of d.results) for (const id of h.image.source_ids) {
+        const prev = hits.get(id);
+        if (!prev || prev.score < h.score) hits.set(id, { score: h.score, text: h.image.body_text });
+      }
+    }
+  } catch (e) {
+    if (my !== sq.seq) return;
+    err = true; hits = null;
+  }
+  sq.hits = hits; sq.err = err;
+  if (started) render();
 }
 
 // 画像ごとのURL（例：/quote-gallery/quote_123.webp）。同名ファイルが複数あるときだけ ?id= を付けて区別する
@@ -354,9 +405,10 @@ function openAt(list, i, random = false, fromUrlOpen = false) {
   const wasOpen = $('#dlg').open;
   box.list = list; box.i = i; box.random = random;
   const it = list[i];
+  const hit = sq.hits && sq.hits.get(it.id);
   $('#dImg').src = src(it.id, 1200);
   $('#dImg').alt = `${it.person} の名言`;
-  $('#dCap').textContent = label(it);
+  $('#dCap').textContent = label(it) + (hit && hit.text ? '\n' + hit.text : ''); // 検索中は読み取った本文も表示
   $('#gd').href = `https://drive.google.com/file/d/${it.id}/view`;
   $('#dl').href = `https://drive.usercontent.google.com/download?id=${it.id}&export=download`;
   $('#dl').setAttribute('download', it.name);
@@ -368,7 +420,7 @@ function openAt(list, i, random = false, fromUrlOpen = false) {
   else if (wasOpen) history.replaceState(null, '', urlOf(it)); // ←→で移動中は履歴を増やさない
   else { history.pushState({ img: it.id }, '', urlOf(it)); box.pushed = true; }
 }
-// 今表示している範囲（選択中の人。「すべて」なら全員）からランダムに1枚選ぶ
+// 今表示している範囲（選択中の人・検索結果。「すべて」なら全員）からランダムに1枚選ぶ
 function openRandom(prevId) {
   const pool = visible();
   if (!pool.length) return;
@@ -403,6 +455,15 @@ document.addEventListener('keydown', e => {
 $('#kDate').onclick = () => { st.key = 'date'; render(); };
 $('#kNew').onclick = () => { st.key = 'new'; render(); };
 $('#dir').onclick = () => { st.dir = st.dir === 'desc' ? 'asc' : 'desc'; render(); };
+
+// 検索欄（日本語入力の変換中は問い合わせない。入力が止まって0.3秒後に検索）
+if (SEARCH_API) {
+  $('#searchBox').hidden = false;
+  const q = $('#q');
+  const go = () => { clearTimeout(sq.timer); sq.timer = setTimeout(() => doSearch(q.value.trim()), 300); };
+  q.addEventListener('input', e => { if (!e.isComposing) go(); });
+  q.addEventListener('compositionend', go);
+}
 
 // 先頭へ戻るボタン：ページ上部（600px）を過ぎたら表示
 const topBtn = $('#top');
